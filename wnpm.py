@@ -10,21 +10,27 @@ import getpass
 import pwd
 import argparse
 import hashlib
-from typing import Dict, List, Any, Tuple
-from terminal_colors import Colors
+import signal
+import logging
+from typing import Dict, List, Any, Tuple, Optional
 
-colors = Colors()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def PrivilegiesVerify() -> bool:
     return os.getuid() == 0
 
 def SudoAuthentication():
     if not PrivilegiesVerify():
-        print(colors("br", "\nThis program requires administrator privileges!\n"))
+        print("\nThis program requires administrator privileges!\n")
         try:
            subprocess.run(["sudo", sys.executable] + sys.argv, check=True)
            sys.exit(0)
-        except Exception:
+        except subprocess.CalledProcessError:
+            print("Failed to obtain sudo privileges.")
+            sys.exit(1)
+        except Exception as error:
+            print(f"Unexpected error: {error}")
             sys.exit(1)
 
 def check_interface_exists(ifname: str) -> bool:
@@ -35,7 +41,7 @@ def check_active_interface(ifname: str) -> bool:
        state_path = pathlib.Path(f"/sys/class/net/{ifname}/operstate")
        return state_path.read_text().strip() == "up"
     except Exception:
-        return False
+       return False
 
 def check_interface_ipv4(ifname: str) -> bool:
     try:
@@ -43,30 +49,32 @@ def check_interface_ipv4(ifname: str) -> bool:
          ["ip", "-4", "addr", "show", "dev", ifname],
          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, text=True
        )
-       #return check_interface_exists(ifname) and check_active_interface(ifname) and "inet " in result.stdout
        return check_active_interface(ifname) and "inet " in result.stdout
     except Exception:
        return False
 
 def set_interface_down(ifname: str) -> bool:
-    print(colors("trying", f"Bringing interface {ifname} down..."))
+    logger.info(f"Bringing interface {ifname} down...")
     try:
-        subprocess.run(["ip", "link", "set", ifname, "down"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["ip", "addr", "flush", "dev", ifname], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(colors("ok", f"Interface {ifname} is down."))
+        subprocess.run(["ip", "link", "set", ifname, "down"], check=True, 
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ip", "addr", "flush", "dev", ifname], check=True, 
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info(f"Interface {ifname} is down.")
         return True
     except subprocess.CalledProcessError as error:
-        print(f"Failed to set interface {ifname} down: {error}")
+        logger.error(f"Failed to set interface {ifname} down: {error}")
         return False
 
 def set_interface_up(ifname: str) -> bool:
-    print(colors("trying", f"Bringing interface {ifname} up..."))
+    logger.info(f"Bringing interface {ifname} up...")
     try:
-       subprocess.run(["ip", "link", "set", ifname, "up"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-       print(colors("ok", f"Interface {ifname} is up."))
+       subprocess.run(["ip", "link", "set", ifname, "up"], check=True, 
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+       logger.info(f"Interface {ifname} is up.")
        return True
     except subprocess.CalledProcessError as error:
-       print(f"Failed to set interface {ifname} up: {error}")
+       logger.error(f"Failed to set interface {ifname} up: {error}")
        return False
 
 def get_mac_address(ifname: str) -> str:
@@ -77,10 +85,11 @@ def get_mac_address(ifname: str) -> str:
         raise ValueError(f"Could not read MAC address for {ifname}")
 
 def _generate_hex_psk(ssid: str, psk: str) -> str:
-    return hashlib.pbkdf2_hmac('sha1', psk.encode('utf-8'), ssid.encode('utf-8'), 4096, 32).hex()
+    return hashlib.pbkdf2_hmac('sha1', psk.encode('utf-8'), 
+                              ssid.encode('utf-8'), 4096, 32).hex()
 
 def validate_interface_profile_data(CONFIG_DIR, ifname: str, profile_data: Dict[str, Any]) -> Dict[str, Any]:
-    print(colors("trying", f"Validating profile for {ifname}..."))
+    logger.info(f"Validating profile for {ifname}...")
 
     if not ifname or not check_interface_exists(ifname):
        raise ValueError(f"Invalid or non-existent interface: {ifname}")
@@ -108,23 +117,23 @@ def validate_interface_profile_data(CONFIG_DIR, ifname: str, profile_data: Dict[
       "hwaddr": hwaddr,
       "metric": metric,
       "ssid": ssid,
-      #"psk": psk,
+      "psk": psk,
       "psk_hex": psk_hex,
       "wpa_supplicant_conf_path": str(wpa_supplicant_conf_path),
       "dhcpcd_conf_path": str(dhcpcd_conf_path),
     }
 
 def parse_config(CONFIG_DIR, config_file_path: pathlib.Path) -> List[Tuple[str, Dict[str, Any]]]:
-    print(colors("trying", f"Parsing config file {config_file_path}..."))
+    logger.info(f"Parsing config file {config_file_path}...")
 
     if not config_file_path or not config_file_path.is_file():
-       print(colors("error", f"Configuration file not found at {config_file_path}"))
+       logger.error(f"Configuration file not found at {config_file_path}")
        sys.exit(1)
     try:
        with config_file_path.open("r", encoding="utf-8") as file:
             data = json.load(file)
     except Exception as error:
-       print(colors("error", f"Error reading JSON config: {error}"))
+       logger.error(f"Error reading JSON config: {error}")
        sys.exit(1)
 
     profiles = []
@@ -133,14 +142,14 @@ def parse_config(CONFIG_DIR, config_file_path: pathlib.Path) -> List[Tuple[str, 
            profile = validate_interface_profile_data(CONFIG_DIR, ifname, profile_data)
            profiles.append((ifname, profile))
         except ValueError as error:
-            print(colors("error", f"Invalid profile for '{ifname}' in {config_file_path}:\n{error}"))
+            logger.error(f"Invalid profile for '{ifname}' in {config_file_path}:\n{error}")
             sys.exit(1)
             
     return profiles
 
 def create_profile(CONFIG_DIR, config_file_path, ifname: str, profile_data: Dict[str, Any]) -> bool:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    print(colors("trying", f"Creating config files for {ifname}..."))
+    logger.info(f"Creating config files for {ifname}...")
 
     data = {}
     if config_file_path.exists():
@@ -148,11 +157,12 @@ def create_profile(CONFIG_DIR, config_file_path, ifname: str, profile_data: Dict
           with config_file_path.open("r", encoding="utf-8") as file:
                data = json.load(file)
        except (json.JSONDecodeError, IOError) as error:
-          print(colors("warning", f"Could not read existing config file {config_file_path}: {error}. A new one will be created."))
+          logger.warning(f"Could not read existing config file {config_file_path}: {error}. A new one will be created.")
        except Exception as error:
-          print(colors("error", f"Could not read existing config file {config_file_path}: {error}."))
+          logger.error(f"Could not read existing config file {config_file_path}: {error}.")
           return False
 
+    wpa_supplicant_conf_path = pathlib.Path(profile_data['wpa_supplicant_conf_path'])
     wpa_supplicant_conf = f"""
 ctrl_interface=/var/run/wpa_supplicant
 network={{
@@ -160,39 +170,93 @@ network={{
     psk={profile_data['psk_hex']}
 }}
 """
-    pathlib.Path(profile_data['wpa_supplicant_conf_path']).write_text(wpa_supplicant_conf.strip() + "\n")
+    wpa_supplicant_conf_path.write_text(wpa_supplicant_conf.strip() + "\n")
+    wpa_supplicant_conf_path.chmod(0o740)
 
+    dhcpcd_conf_path = pathlib.Path(profile_data['dhcpcd_conf_path'])
     dhcpcd_conf = f"""
 interface {ifname}
 metric {profile_data['metric']}
 """
-    pathlib.Path(profile_data['dhcpcd_conf_path']).write_text(dhcpcd_conf.strip() + "\n")
+    dhcpcd_conf_path.write_text(dhcpcd_conf.strip() + "\n")
+    dhcpcd_conf_path.chmod(0o740)
 
-    data[ifname] = profile_data
+    data[ifname] = {
+        "metric": profile_data["metric"],
+        "ssid": profile_data["ssid"],
+        "psk": profile_data["psk"],  # Note: storing plaintext PSK - consider security implications
+    }
 
     with config_file_path.open("w", encoding="utf-8") as file:
          json.dump(data, file, indent=2, ensure_ascii=False)
 
-    print(colors("ok", f"Profile for '{ifname}' created/updated successfully!"))
+    config_file_path.chmod(0o740)
+
+    logger.info(f"Profile for '{ifname}' created/updated successfully!")
     return True
 
-WPA_PROCESSES: dict[str, subprocess.Popen] = {}
-NETWORK_SERVICES = ["wpa_supplicant", "dhcpcd"]
-
-def _kill_all_network_services():
-    print(colors("trying", f"Stopping existing network services: {NETWORK_SERVICES}"))
-    for service in NETWORK_SERVICES:
-        subprocess.run(["pkill", "-9", service], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def _stop_wpa_proc(ifname: str):
-    proc = WPA_PROCESSES.pop(ifname, None)
-    if proc and proc.poll() is None:
-        proc.terminate()
+class WPAProcessManager:
+    """Gerenciador de processos wpa_supplicant"""
+    
+    def __init__(self):
+        self.processes: Dict[str, subprocess.Popen] = {}
+    
+    def stop_all(self):
+        """Para todos os processos gerenciados"""
+        for ifname, proc in list(self.processes.items()):
+            self.stop(ifname)
+    
+    def stop(self, ifname: str):
+        """Para um processo específico"""
+        proc = self.processes.pop(ifname, None)
+        if proc and proc.poll() is None:
+            logger.info(f"Stopping wpa_supplicant for {ifname}")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            logger.info(f"wpa_supplicant process for {ifname} stopped.")
+    
+    def start(self, ifname: str, config_path: str) -> bool:
+        """Inicia o wpa_supplicant para uma interface"""
+        self.stop(ifname)  # Para qualquer instância existente
+        
+        socket_path = pathlib.Path(f"/var/run/wpa_supplicant/{ifname}")
+        if socket_path.exists():
+            try:
+                os.remove(socket_path)
+            except OSError as e:
+                logger.error(f"Could not remove old socket file {socket_path}: {e}")
+                
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        print(colors("ok", f"wpa_supplicant process for {ifname} stopped."))
+            logger.info(f"Starting wpa_supplicant for {ifname}")
+            proc = subprocess.Popen(
+                ["wpa_supplicant", "-i", ifname, "-c", config_path, "-D", "nl80211"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self.processes[ifname] = proc
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start wpa_supplicant for {ifname}: {e}")
+            return False
+
+# Instância global do gerenciador de processos
+wpa_manager = WPAProcessManager()
+
+def cleanup_network_processes():
+    """Limpa processos de rede residual"""
+    logger.info("Cleaning up network processes")
+    wpa_manager.stop_all()
+    
+    # Mata quaisquer processos wpa_supplicant restantes
+    subprocess.run(["pkill", "-9", "wpa_supplicant"], 
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Para o dhcpcd service se estiver rodando
+    subprocess.run(["pkill", "-9", "dhcpcd"], 
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def _check_wpa_cli_status(ifname: str) -> bool:
     try:
@@ -205,81 +269,64 @@ def _check_wpa_cli_status(ifname: str) -> bool:
         return False
 
 def _start_wpa_supplicant(ifname: str, profile_data: dict) -> bool:
-    _stop_wpa_proc(ifname)
-
-    socket_path = pathlib.Path(f"/var/run/wpa_supplicant/{ifname}")
-    if socket_path.exists():
-        try:
-            os.remove(socket_path)
-        except OSError as e:
-            print(colors("error", f"Could not remove old socket file {socket_path}: {e}"))
-            
-    try:
-        print(colors("trying", f"Starting wpa_supplicant for {ifname} (SSID: {profile_data['ssid']})"))
-        proc = subprocess.Popen(
-          ["wpa_supplicant", "-i", ifname, "-c", profile_data["wpa_supplicant_conf_path"], "-D", "nl80211"],
-          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        WPA_PROCESSES[ifname] = proc
-    except Exception as e:
-        print(colors("error", f"Failed to start wpa_supplicant for {ifname}: {e}"))
+    if not wpa_manager.start(ifname, profile_data["wpa_supplicant_conf_path"]):
         return False
     
     for _ in range(20):
         if _check_wpa_cli_status(ifname):
-           print(colors("ok", f"wpa_supplicant connected on {ifname}."))
+           logger.info(f"wpa_supplicant connected on {ifname}.")
            return True
         time.sleep(1)
         
-    print(colors("error", f"Timeout waiting for wpa_supplicant connection on {ifname}."))
-    _stop_wpa_proc(ifname)
+    logger.error(f"Timeout waiting for wpa_supplicant connection on {ifname}.")
+    wpa_manager.stop(ifname)
     return False
 
 def _start_dhcpcd(ifname: str, profile_data: dict) -> bool:
     try:
-       print(colors("trying", f"Requesting IP address for {ifname}..."))
+       logger.info(f"Requesting IP address for {ifname}...")
        subprocess.run(
          ["dhcpcd", "-1", ifname, "-f", profile_data["dhcpcd_conf_path"]],
          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True
        )
-       print(colors("ok", f"IP address acquired for {ifname}."))
+       logger.info(f"IP address acquired for {ifname}.")
        return True
     except subprocess.CalledProcessError as error:
-       print(colors("error", f"DHCP failed for {ifname}: {error.stderr.decode().strip()}"))
+       logger.error(f"DHCP failed for {ifname}: {error.stderr.decode().strip()}")
        return False
     except Exception as error:
-       print(colors("error", f"An unexpected error occurred during DHCP for {ifname}: {error}"))
+       logger.error(f"An unexpected error occurred during DHCP for {ifname}: {error}")
        return False
 
 def connection(profile: Tuple[str, Dict[str, Any]]) -> bool:
     ifname, profile_data = profile
     if _start_wpa_supplicant(ifname, profile_data):
        if _start_dhcpcd(ifname, profile_data):
-          print(colors("ok", f"Connection successful on {ifname}!"))
+          logger.info(f"Connection successful on {ifname}!")
           return True
     
-    print(colors("error", f"Connection failed on {ifname}."))
+    logger.error(f"Connection failed on {ifname}.")
     return False
 
 def start(profiles: List[Tuple[str, Dict[str, Any]]], background: bool):
     if not profiles:
-       print(colors("error", "No valid profiles found."))
+       logger.error("No valid profiles found.")
        return
 
     profiles.sort(key=lambda p: p[1]["metric"])
-    _kill_all_network_services()
+    cleanup_network_processes()
 
     if not background:
        ifname, profile_data = profiles[0]
        set_interface_down(ifname)
        set_interface_up(ifname)
        if connection((ifname, profile_data)):
-          print(colors("ok", "Connection established. The script will now exit."))
+          logger.info("Connection established. The script will now exit.")
           return
-       print(colors("error", "Could not establish a connection using any available profile."))
+       logger.error("Could not establish a connection using any available profile.")
        return
 
-    print(colors("warning", "Monitoring mode activated (Ctrl+C to exit)"))
+    logger.info("Monitoring mode activated (Ctrl+C to exit)")
     active_ifname = None
 
     try:
@@ -295,12 +342,12 @@ def start(profiles: List[Tuple[str, Dict[str, Any]]], background: bool):
 
           if best_candidate_ifname != active_ifname:
              if active_ifname and check_interface_exists(active_ifname):
-                print(colors("trying", f"Switching from '{active_ifname}' to a better interface..."))
+                logger.info(f"Switching from '{active_ifname}' to a better interface...")
                 set_interface_down(active_ifname)
-                _stop_wpa_proc(active_ifname)
+                wpa_manager.stop(active_ifname)
 
              if best_candidate_ifname:
-                print(colors("ok", f"New target interface is '{best_candidate_ifname}'. Attempting to connect."))
+                logger.info(f"New target interface is '{best_candidate_ifname}'. Attempting to connect.")
                 active_ifname = best_candidate_ifname
                 current_profile = next(p for i, p in profiles if i == active_ifname)
                 set_interface_up(active_ifname)
@@ -310,21 +357,21 @@ def start(profiles: List[Tuple[str, Dict[str, Any]]], background: bool):
 
           elif active_ifname:
              if not check_interface_ipv4(active_ifname):
-                print(colors("warning", f"Connection on '{active_ifname}' seems down (no IP). Reconnecting..."))
+                logger.warning(f"Connection on '{active_ifname}' seems down (no IP). Reconnecting...")
                 current_profile = next(p for i, p in profiles if i == active_ifname)
                 connection((active_ifname, current_profile))
 
           time.sleep(5)
 
     except KeyboardInterrupt:
-       print(colors("ok", "\nMonitoring stopped by user."))
+       logger.info("\nMonitoring stopped by user.")
     except Exception as error:
-       print(colors("error", f"\nMonitoring stopped by Error: {error}"))
+       logger.error(f"\nMonitoring stopped by Error: {error}")
     finally:
        if active_ifname:
           set_interface_down(active_ifname)
-       _kill_all_network_services()
-       print(colors("ok", "Cleaned up all connections."))
+       cleanup_network_processes()
+       logger.info("Cleaned up all connections.")
 
 def scan(ifname: str):
     print("Scan function is under development.")
@@ -337,6 +384,8 @@ def main():
     pw = pwd.getpwnam(real_user)
     home_dir = pathlib.Path(pw.pw_dir)
     CONFIG_DIR = home_dir / ".config" / "WNPM"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o740)
     config_file_path = CONFIG_DIR / "wnpm-config.json"
 
     parser = argparse.ArgumentParser(description="A Python script to manage network connections.", formatter_class=argparse.RawTextHelpFormatter)
@@ -376,7 +425,7 @@ def main():
           valid_profile = validate_interface_profile_data(CONFIG_DIR, ifname, temp_profile)
           create_profile(CONFIG_DIR, config_file_path, ifname, valid_profile)
        except (ValueError, KeyboardInterrupt) as error:
-          print(colors("error", f"\nProfile creation cancelled. Error: {error}"))
+          logger.error(f"\nProfile creation cancelled. Error: {error}")
           sys.exit(1)
 
 if __name__ == "__main__":
