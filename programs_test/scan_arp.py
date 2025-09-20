@@ -1,47 +1,53 @@
-from scapy.layers.l2 import ARP, Ether
-from scapy.layers.inet import IP
-from scapy.sendrecv import srp, srp1
+#!/usr/bin/env python3
+import argparse
 import socket
+import json
+from scapy.all import ARP, Ether, srp
 
-def scan_arp():
-    hosts_on = []
-    hosts_off = []
-    mac_address = 'a4:f9:33:ed:5b:75'
-    packet_arp = Ether(src=mac_address, dst='ff:ff:ff:ff:ff:ff') / ARP(op=1, hwsrc=mac_address, pdst='192.168.0.0/24')
+def mac_oui_vendors_identify(mac_oui):
+    with open('./mac-vendors-export.json', 'r', encoding='utf-8') as file:
+         data = json.load(file)
+         vendors_name = {}
+         for line in data:
+             vendors_name[line['macPrefix']] = line['vendorName']
+         return vendors_name.get(mac_oui.upper()[:8], 'Unknown Vendor Type')
 
-    packets_sent_recv, packets_no_response = srp(packet_arp, timeout=6, iface='wlan0')
+def scan_arp(ifname: str, network: str, timeout: int = 5):
+    print(f"\n[+] Scanning network {network} on interface {ifname} ...")
 
-    for sent_packet, recv_packet in packets_sent_recv:
-        if recv_packet:
-           ip_host = recv_packet.psrc
-           try:
-              hostname = socket.gethostbyaddr(ip_host)
-              hosts_on.append(hostname)
-           except socket.herror:
-                  pass
+    hosts_online = []
 
-    for packet in packets_no_response:
-        ip_host = packet.pdst
+    packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=network)
+
+    answered, _ = srp(packet, timeout=timeout, iface=ifname, verbose=0)
+
+    for sent, recv in answered:
+        ip = recv.psrc
+        mac = recv.hwsrc
+        vendor = mac_oui_vendors_identify(mac)
         try:
-           hostname = socket.gethostbyaddr(ip_host)
-           hosts_on.append(hostname)
-        except socket.herror as error:
-               hosts_off.append(f'HOST OFF: {ip_host}')
-    
-    for host in hosts_off:
-        print(host)
-    print('\n')
+            hostname = socket.gethostbyaddr(ip)[0]
+        except socket.herror:
+            hostname = ip
+        hosts_online.append((ip, mac, vendor, hostname))
 
-    print(packets_sent_recv.summary())
-    print('\n')
+    return hosts_online
 
-    try:
-       print(hosts_on)
-       print('\n')
-       gateway_ip = hosts_on[0][2][0]
-       print(f"GATEWAY ROUTER: {gateway_ip}")
-    except:
-          print("\nhosts on, not found );")
+def main():
+    parser = argparse.ArgumentParser(description="ARP Scanner - Scan networks to discover hosts")
+    parser.add_argument("-i", "--ifname", required=True, help="Network interface to use, ex: wlan0")
+    parser.add_argument("network", help="Network to scan, ex: 192.168.0.0/24")
+    parser.add_argument("-t", "--timeout", type=int, default=5, help="Timeout for ARP responses")
+    args = parser.parse_args()
 
-scan_arp()
-print('\n')
+    online = scan_arp(args.ifname, args.network, args.timeout)
+
+    print("\n[+] Hosts ONLINE:")
+    if online:
+        for ip, mac, vendor, hostname in online:
+            print(f" - {ip} | {mac} | {vendor} | {hostname}")
+    else:
+        print(" No hosts online found.")
+
+if __name__ == "__main__":
+    main()

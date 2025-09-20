@@ -1,6 +1,6 @@
 # Wireless Network Profile Manager (WNPM)
 
-A simple command‑line utility to manage **dhcpcd** and **wpa\_supplicant** configuration files for wireless network profiles.
+A simple command-line utility for managing network interface connections to Wi-Fi networks in a dynamic and customizable way.
 
 ---
 
@@ -20,6 +20,8 @@ It automates editing these files while respecting their official configuration s
 * Create or update profiles using the `create-profile` command.
 * Keep network configurations organized and reusable.
 * Compatible with standard Linux tools (`dhcpcd`, `wpa_supplicant`).
+* Set interface priority, automatic reconnection to the priority interface, which is dynamically set according to its availability.
+* Customize dhcpcd and wpa_supplicant configuration files as needed, consult the documentation, and be careful when setting psk directly to the wpa_supplicant or wnpm-config.json configuration file.
 
 ---
 
@@ -27,23 +29,13 @@ It automates editing these files while respecting their official configuration s
 
 ```bash
 # Clone the repository
- git clone https://github.com/youruser/wnpm.git
- cd wnpm
-
-# Run the setup script (creates a Python virtual environment)
- ./setup.sh
+ git clone https://github.com/gusprojects008/WNPM.git
+ cd WNPM
 ```
-
-> Use `./setup.sh --force` to recreate the virtual environment if needed.
-
----
 
 ## Usage
 
 ```bash
-# Activate the virtual environment
-source venv/bin/activate
-
 # Show help
 python wnpm.py --help
 
