@@ -6,7 +6,8 @@ import shutil
 import subprocess
 import time
 import json
-import pathlib
+from pathlib import Path
+import re
 import getpass
 import pwd
 import argparse
@@ -18,20 +19,28 @@ from typing import Dict, List, Any, Tuple, Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def PrivilegiesVerify() -> bool:
-    return os.getuid() == 0
+def check_root_privilegies() -> bool:
+    if os.getuid() != 0:
+        raise PermissionError(f"This program requires administrator privileges! Run with sudo:\nsudo {sys.executable} {Path(__file__).resolve()} {' '.join(sys.argv[1:]) if len(sys.argv) > 1 else ''}")
 
-def SudoAuthentication():
-    if not PrivilegiesVerify():
-        print(f"This program requires administrator privileges! Run with sudo:\nsudo {sys.executable} {pathlib.Path(__file__).resolve()} {' '.join(sys.argv[1:]) if len(sys.argv) > 1 else ''}")
-        sys.exit(1)
+def new_file_path(base: str = None, ext: str = None, filename: str = None) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if not filename:
+        if base and ext:
+            return Path(f"{base}-{timestamp}{ext}")
+        elif base:
+            return Path(f"{base}-{timestamp}")
+        else:
+            return Path(f"{timestamp}")
+    else:
+        return Path(f"{timestamp}-{filename}")
 
 def check_interface_exists(ifname: str) -> bool:
-    return pathlib.Path(f"/sys/class/net/{ifname}").exists()
+    return Path(f"/sys/class/net/{ifname}").exists()
 
 def check_active_interface(ifname: str) -> bool:
     try:
-       state_path = pathlib.Path(f"/sys/class/net/{ifname}/operstate")
+       state_path = Path(f"/sys/class/net/{ifname}/operstate")
        return state_path.read_text().strip() == "up"
     except Exception:
        return False
@@ -79,7 +88,7 @@ def restart_interface(ifname: str) -> bool:
 
 def get_mac_address(ifname: str) -> str:
     try:
-        path = pathlib.Path(f"/sys/class/net/{ifname}/address")
+        path = Path(f"/sys/class/net/{ifname}/address")
         return path.read_text().strip()
     except Exception:
         raise ValueError(f"Could not read MAC address for {ifname}")
@@ -94,6 +103,9 @@ def check_internet_connection(ifname: str) -> bool:
     except Exception:
         return False
 
+def is_wireless(ifname: str) -> bool:
+    return Path(f"/sys/class/net/{ifname}/wireless").exists()
+
 def _generate_hex_psk(ssid: str, psk: str) -> str:
     return hashlib.pbkdf2_hmac('sha1', psk.encode('utf-8'), ssid.encode('utf-8'), 4096, 32).hex()
 
@@ -101,38 +113,48 @@ def validate_interface_profile_data(CONFIG_DIR, ifname: str, profile_data: Dict[
     logger.info(f"Validating profile for {ifname}...")
 
     if not ifname or not check_interface_exists(ifname):
-       raise ValueError(f"Invalid or non-existent interface: {ifname}")
+        raise ValueError(f"Invalid or non-existent interface: {ifname}")
 
     hwaddr = get_mac_address(ifname)
     metric = profile_data.get("metric", 100)
 
     if not isinstance(metric, int) or metric <= 0:
-       raise ValueError(f"Invalid metric for {ifname}: {metric}")
+        raise ValueError(f"Invalid metric for {ifname}: {metric}")
 
-    ssid = profile_data.get("ssid", "").strip()
-    if not ssid or len(ssid) > 32:
-       raise ValueError(f"SSID for {ifname} must be between 1 and 32 characters.")
+    if is_wireless(ifname):
+        ssid = profile_data.get("ssid", "").strip()
+        if not ssid or len(ssid) > 32:
+            raise ValueError(f"SSID for {ifname} must be between 1 and 32 characters.")
 
-    psk = profile_data.get("psk", "").strip()
-    if not (8 <= len(psk) <= 63):
-       raise ValueError(f"PSK for {ifname} must be between 8 and 63 characters.")
-    
-    psk_hex = _generate_hex_psk(ssid, psk)
+        psk = profile_data.get("psk", "").strip()
+        if not (8 <= len(psk) <= 63):
+            raise ValueError(f"PSK for {ifname} must be between 8 and 63 characters.")
+        
+        psk_hex = _generate_hex_psk(ssid, psk)
 
-    wpa_supplicant_conf_path = CONFIG_DIR / f"wpa-supplicant-{ifname}.conf"
-    dhcpcd_conf_path = CONFIG_DIR / f"dhcpcd-{ifname}.conf"
+        wpa_supplicant_conf_path = CONFIG_DIR / f"wpa-supplicant-{ifname}.conf"
+        dhcpcd_conf_path = CONFIG_DIR / f"dhcpcd-{ifname}.conf"
 
-    return {
-      "hwaddr": hwaddr,
-      "metric": metric,
-      "ssid": ssid,
-      "psk": psk,
-      "psk_hex": psk_hex,
-      "wpa_supplicant_conf_path": str(wpa_supplicant_conf_path),
-      "dhcpcd_conf_path": str(dhcpcd_conf_path),
-    }
+        return {
+            "hwaddr": hwaddr,
+            "type": "wireless",
+            "metric": metric,
+            "ssid": ssid,
+            "psk": psk,
+            "psk_hex": psk_hex,
+            "wpa_supplicant_conf_path": str(wpa_supplicant_conf_path),
+            "dhcpcd_conf_path": str(dhcpcd_conf_path),
+        }
+    else:
+        dhcpcd_conf_path = CONFIG_DIR / f"dhcpcd-{ifname}.conf"
+        return {
+            "hwaddr": hwaddr,
+            "type": "ethernet",
+            "metric": metric,
+            "dhcpcd_conf_path": str(dhcpcd_conf_path),
+        }
 
-def parse_config(CONFIG_DIR, config_file_path: pathlib.Path) -> List[Tuple[str, Dict[str, Any]]]:
+def parse_config(CONFIG_DIR, config_file_path: Path) -> List[Tuple[str, Dict[str, Any]]]:
     logger.info(f"Parsing config file {config_file_path}...")
 
     if not config_file_path or not config_file_path.is_file():
@@ -153,13 +175,93 @@ def parse_config(CONFIG_DIR, config_file_path: pathlib.Path) -> List[Tuple[str, 
          except Exception as error:
              logger.error(f"Unexpected error adding profile of '{ifname}' in profiles list:\n{error}")
              sys.exit(1)
-            
+
     return profiles
 
 class ProfilesManager:
-    def __init__(self, CONFIG_DIR: pathlib.Path, config_file_path: pathlib.Path):
+    def __init__(self, CONFIG_DIR: Path, config_file_path: Path):
         self.config_dir = CONFIG_DIR
         self.config_file_path = config_file_path
+
+    def create_profile(self, ifname: str, valid_profile: Dict[str, Any]) -> bool:
+        logging.info(f"Attempting to create profile for {ifname}...")
+
+        if valid_profile["type"] == "wireless":
+            wpa_supplicant_conf_path = Path(valid_profile['wpa_supplicant_conf_path'])
+            wpa_supplicant_conf = f"ctrl_interface=/var/run/wpa_supplicant\nnetwork={{\n    ssid=\"{valid_profile['ssid']}\"\n    psk={valid_profile['psk_hex']}\n}}"
+            wpa_supplicant_conf_path.write_text(wpa_supplicant_conf.strip() + "\n")
+            wpa_supplicant_conf_path.chmod(0o740)
+
+        dhcpcd_conf_path = Path(valid_profile['dhcpcd_conf_path'])
+        dhcpcd_conf = f"interface {ifname}\nmetric {valid_profile['metric']}"
+        dhcpcd_conf_path.write_text(dhcpcd_conf.strip() + "\n")
+        dhcpcd_conf_path.chmod(0o740)
+
+        all_profiles = self._read_profiles()
+        all_profiles[ifname] = valid_profile
+        self._write_profiles(all_profiles)
+
+        logging.info(f"Profile for '{ifname}' created/updated successfully!")
+        return True
+
+    def list_profiles(self):
+        data = self._read_profiles()
+        if not data:
+            logging.info("No network profiles found.")
+            return
+        logging.info("Existing network profiles:")
+        for ifname, profile in data.items():
+            logging.info(f"\n\n{ifname} => {profile}\n")
+                
+    def remove_profile(self, ifname: str) -> bool:
+        all_profiles = self._read_profiles()
+
+        if ifname not in all_profiles:
+            logging.error(f"Profile for '{ifname}' not found.")
+            return False
+        
+        try:
+            profile_to_remove = all_profiles[ifname]
+            valid_profile = validate_interface_profile_data(self.config_dir, ifname, profile_to_remove)
+            if valid_profile["type"] == "wireless":
+                Path(profile_data['wpa_supplicant_conf_path']).unlink(missing_ok=True)
+            Path(valid_profile['dhcpcd_conf_path']).unlink(missing_ok=True)
+            logging.info(f"Cleaned up config files for '{ifname}'.")
+
+        except ValueError as error:
+            logging.warning(f"Could not get associated file paths for '{ifname}', but proceeding with removal from main config: {error}")
+        except Exception as error:
+            logging.error(f"An error occurred during file cleanup for '{ifname}': {error}")
+            return False
+
+        del all_profiles[ifname]
+        self._write_profiles(all_profiles)
+        
+        logging.info(f"Profile for '{ifname}' removed successfully!")
+        return True
+
+    def remove_all_profiles(self) -> bool:
+        if not self.config_file_path.exists():
+            logging.info("No profiles to remove.")
+            return True
+        try:
+            profiles_to_delete = parse_config(self.config_dir, self.config_file_path)
+            for ifname, profile_data in profiles_to_delete:
+                if profile_data["type"] == "wireless":
+                    Path(profile_data['wpa_supplicant_conf_path']).unlink(missing_ok=True)
+                Path(profile_data['dhcpcd_conf_path']).unlink(missing_ok=True)
+                logging.info(f"Removed config files for '{ifname}'.")
+            self.config_file_path.unlink()
+            logging.info("All network profiles have been removed.")
+            return True
+        except SystemExit:
+            logging.info("Failed to parse config file for cleanup. Doing Manual cleanup...")
+            if self.config_dir.exists():
+                shutil.rmtree(self.config_dir)
+            return True
+        except Exception as error:
+            logging.error("Failed to parse config file for cleanup. Manual cleanup may be required.")
+            return
 
     def _read_profiles(self) -> Dict[str, Any]:
         if not self.config_file_path.exists():
@@ -181,95 +283,7 @@ class ProfilesManager:
             self.config_file_path.chmod(0o740)
         except Exception as error:
             logging.error(f"Failed to write to {self.config_file_path}: {error}.")
-            raise
-
-    def create_profile(self, ifname: str, valid_profile: Dict[str, Any]) -> bool:
-        logging.info(f"Attempting to create profile for {ifname}...")
-
-        wpa_supplicant_conf_path = pathlib.Path(valid_profile['wpa_supplicant_conf_path'])
-        wpa_supplicant_conf = f"ctrl_interface=/var/run/wpa_supplicant\nnetwork={{\n    ssid=\"{valid_profile['ssid']}\"\n    psk={valid_profile['psk_hex']}\n}}"
-        wpa_supplicant_conf_path.write_text(wpa_supplicant_conf.strip() + "\n")
-        wpa_supplicant_conf_path.chmod(0o740)
-
-        dhcpcd_conf_path = pathlib.Path(valid_profile['dhcpcd_conf_path'])
-        dhcpcd_conf = f"interface {ifname}\nmetric {valid_profile['metric']}"
-        dhcpcd_conf_path.write_text(dhcpcd_conf.strip() + "\n")
-        dhcpcd_conf_path.chmod(0o740)
-
-        all_profiles = self._read_profiles()
-        all_profiles[ifname] = {
-          "metric": valid_profile["metric"],
-          "ssid": valid_profile["ssid"],
-          "psk": valid_profile["psk"],
-        }
-        self._write_profiles(all_profiles)
-
-        logging.info(f"Profile for '{ifname}' created/updated successfully!")
-        return True
-
-    def list_profiles(self):
-        data = self._read_profiles()
-        if not data:
-            logging.info("No network profiles found.")
-            return
-
-        logging.info("Existing network profiles:")
-        for ifname, profile in data.items():
-            ssid = profile.get('ssid', 'N/A')
-            metric = profile.get('metric', 'N/A')
-            psk = profile.get('psk', 'N/A')
-            logging.info(f"Interface: {ifname}, SSID: {ssid}, Metric: {metric}, PSK: {psk}")
-
-    def remove_profile(self, ifname: str) -> bool:
-        all_profiles = self._read_profiles()
-        if ifname not in all_profiles:
-            logging.error(f"Profile for '{ifname}' not found.")
-            return False
-        
-        try:
-            profile_to_remove = all_profiles[ifname]
-            valid_profile = validate_interface_profile_data(self.config_dir, ifname, profile_to_remove)
-            
-            pathlib.Path(valid_profile['wpa_supplicant_conf_path']).unlink(missing_ok=True)
-            pathlib.Path(valid_profile['dhcpcd_conf_path']).unlink(missing_ok=True)
-            logging.info(f"Cleaned up config files for '{ifname}'.")
-
-        except ValueError as error:
-            logging.warning(f"Could not get associated file paths for '{ifname}', but proceeding with removal from main config: {error}")
-        except Exception as error:
-            logging.error(f"An error occurred during file cleanup for '{ifname}': {error}")
-            return False
-
-        del all_profiles[ifname]
-        self._write_profiles(all_profiles)
-        
-        logging.info(f"Profile for '{ifname}' removed successfully!")
-        return True
-
-    def remove_all_profiles(self) -> bool:
-        if not self.config_file_path.exists():
-            logging.info("No profiles to remove.")
-            return True
-
-        try:
-            profiles_to_delete = parse_config(self.config_dir, self.config_file_path)
-            
-            for ifname, profile_data in profiles_to_delete:
-                pathlib.Path(profile_data['wpa_supplicant_conf_path']).unlink(missing_ok=True)
-                pathlib.Path(profile_data['dhcpcd_conf_path']).unlink(missing_ok=True)
-                logging.info(f"Removed config files for '{ifname}'.")
-
-            self.config_file_path.unlink()
-            logging.info("All network profiles have been removed.")
-            return True
-        except SystemExit:
-            logging.info("Failed to parse config file for cleanup. Doing Manual cleanup...")
-            if self.config_dir.exists():
-                shutil.rmtree(self.config_dir)
-            return True
-        except Exception as error:
-            logging.error("Failed to parse config file for cleanup. Manual cleanup may be required.")
-            return False
+            raise False
 
 class WPAProcessManager:
     def __init__(self):
@@ -278,7 +292,7 @@ class WPAProcessManager:
     def start(self, ifname: str, config_path: str) -> bool:
         self.stop(ifname)
         
-        socket_path = pathlib.Path(f"/var/run/wpa_supplicant/{ifname}")
+        socket_path = Path(f"/var/run/wpa_supplicant/{ifname}")
         if socket_path.exists():
             try:
                 os.remove(socket_path)
@@ -369,12 +383,13 @@ def _start_dhcpcd(ifname: str, profile_data: dict) -> bool:
 def connection(profile: Tuple[str, Dict[str, Any]]) -> bool:
     ifname, profile_data = profile
     restart_interface(ifname)
-    if _start_wpa_supplicant(ifname, profile_data):
-        if _start_dhcpcd(ifname, profile_data):
-           if check_internet_connection(ifname):
-              logger.info(f"Connection successful on {ifname}!")
-              return True
-    
+    if profile_data["type"] == "wireless":
+        if not _start_wpa_supplicant(ifname, profile_data):
+            return False
+    if _start_dhcpcd(ifname, profile_data):
+        if check_internet_connection(ifname):
+            logger.info(f"Connection successful on {ifname}!")
+            return True
     logger.error(f"Connection failed on {ifname}.")
     return False
 
@@ -439,22 +454,130 @@ def start(profiles: List[Tuple[str, Dict[str, Any]]], background: bool, sleep_ti
        logger.error(f"\nMonitoring stopped by Error: {error}")
     finally:
        cleanup_network_processes()
+       set_interface_down(active_ifname)
        logger.info("Cleaned up all connections.")
 
-def scan(ifname: str):
-    print("Scan function is under development.")
-    pass
+def scan(ifname: str, output_filename: str = None):
+    print("In development, see https://github.com/gusprojects008/wnlpy\n")
+    print(f"Scanning Wi-Fi networks on {ifname}...\n")
+
+    if not Path(f"/sys/class/net/{ifname}").exists():
+        logger.error(f"Interface '{ifname}' not found.")
+        return
+
+    try:
+        result = subprocess.run(
+            ["iw", "dev", ifname, "scan"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except FileNotFoundError:
+        logger.error("'iw' command not found. Please install wireless tools.")
+        return
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Scan failed: {e}")
+        return
+
+    if not result.stdout.strip():
+        print("No networks found.")
+        return
+
+    def extract(pattern: str, text: str, default: str = "N/A") -> str:
+        match = re.search(pattern, text)
+        return match.group(1).strip() if match else default
+
+    def security_type(block: str) -> str:
+        if "WPA3" in block or "SAE" in block:
+            return "WPA3"
+        if "WPA2" in block or "RSN:" in block:
+            return "WPA2"
+        if "WPA:" in block:
+            return "WPA"
+        if "privacy" in block:
+            return "WEP"
+        return "OPEN"
+
+    def wps_status(block: str) -> str:
+        if "WPS:" not in block:
+            return "Disabled"
+        status = "Enabled"
+        state = extract(r"Wi-Fi Protected Setup State:\s*\d+\s*\((\w+)\)", block, "")
+        methods = extract(r"Config methods:\s*(.+)", block, "")
+        locked = "[LOCKED]" if "AP setup locked: 0x01" in block else ""
+        details = f" ({state})" if state else ""
+        details += f" - {methods}" if methods else ""
+        return f"{status}{details} {locked}".strip()
+
+    def encryption_modes(block: str) -> str:
+        enc = []
+        if "CCMP" in block:
+            enc.append("AES")
+        if "TKIP" in block:
+            enc.append("TKIP")
+        return ", ".join(enc) if enc else "None"
+
+    def security_flags(block: str) -> str:
+        flags = []
+        if "WPA3" in block or "SAE" in block:
+            flags.append("WPA3")
+        if "Management frame protection: required" in block:
+            flags.append("PMF-Required")
+        elif "Management frame protection: capable" in block:
+            flags.append("PMF-Capable")
+        return ", ".join(flags) if flags else "None"
+
+    def print_network(num: int, block: str):
+        print(
+            f"┌─── NETWORK #{num} {'─' * 50}\n"
+            f"│ SSID: {extract(r'SSID:\s*(.+)', block, 'Hidden')}\n"
+            f"│ BSSID: {extract(r'^([0-9a-f:]{17})', block)}\n"
+            f"│ Signal: {extract(r'signal:\s*([-\d.]+)\s*dBm', block)} dBm | "
+            f"Channel: {extract(r'DS Parameter set:\s*channel\s*(\d+)', block)} | "
+            f"Freq: {extract(r'freq:\s*([\d.]+)', block)} MHz\n"
+            f"│ Security: {security_type(block)}\n"
+            f"│ Encryption: {encryption_modes(block)}\n"
+            f"│ Vendor: {extract(r'Manufacturer:\s*(.+)', block, 'Unknown')}\n"
+            f"│ WPS: {wps_status(block)}\n"
+            f"│ Security Flags: {security_flags(block)}\n"
+            f"└{'─' * 60}"
+        )
+
+    blocks = result.stdout.strip().split("\nBSS ")[1:]
+    if not blocks:
+        print("No networks found.")
+        return
+
+    output_path = new_file_path("station-scan-result", ".txt", filename=output_filename)
+    output_path.write_text(result.stdout)
+    for i, block in enumerate(blocks, 1):
+        print_network(i, block)
+
+    print(f"\nTotal networks found: {len(blocks)}")
+
+def list_interfaces() -> List[str]:
+    try:
+        interfaces = [iface.name for iface in Path("/sys/class/net").iterdir() if iface.is_dir()]
+        if not interfaces:
+            logger.warning("No network interfaces found.")
+        if interfaces:
+            print("Available interfaces:")
+            for iface in interfaces:
+                print(f" - {iface}")
+    except Exception as error:
+        logger.error(f"Failed to list system interfaces: {error}")
+        return []
 
 def main():
-    SudoAuthentication()
+    check_root_privilegies()
 
     real_user = os.environ.get("SUDO_USER") or os.getlogin()
     pw = pwd.getpwnam(real_user)
-    home_dir = pathlib.Path(pw.pw_dir)
-    CONFIG_DIR = home_dir / ".config" / "WNPM"
+    home_dir = Path(pw.pw_dir)
+    CONFIG_DIR = home_dir / ".config" / "nipm"
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.chmod(0o740)
-    config_file_path = CONFIG_DIR / "wnpm-config.json"
+    config_file_path = CONFIG_DIR / "nipm-config.json"
     profiles_manager = ProfilesManager(CONFIG_DIR, config_file_path)
 
     parser = argparse.ArgumentParser(description="A Python script to manage network connections.", formatter_class=argparse.RawTextHelpFormatter)
@@ -471,10 +594,13 @@ def main():
 
     start_parser = subparsers.add_parser("start", help="Connect to a network.")
     start_parser.add_argument("-b", "--background", action="store_true", help="Run in monitoring mode with failover and failback.")
-    start_parser.add_argument("-s", "--sleep", type=int, default=6, help="Time to next interface check (seconds, default = 6)")
+    start_parser.add_argument("-s", "--sleep", type=int, default=4, help="Time to next interface check (seconds, default = 6)")
 
     scan_parser = subparsers.add_parser("scan", help="Scan for wireless networks.")
-    scan_parser.add_argument("-i", "--ifname", required=True, help="The wireless interface to use for scanning.")
+    scan_parser.add_argument("ifname", type=str, help="The wireless interface to use for scanning.")
+    scan_parser.add_argument("--output", "-o", type=str, default=None, help="Output filename to scan results.")
+
+    list_interfaces_parser = subparsers.add_parser("list-interfaces", help="List Network Interfaces.")
 
     args = parser.parse_args()
 
@@ -482,33 +608,35 @@ def main():
        profiles = parse_config(CONFIG_DIR, config_file_path)
        start(profiles, args.background, args.sleep)
     elif args.command == "scan":
-       scan(args.ifname)
+       scan(args.ifname, args.output)
     elif args.command == "create-profile":
-        ifname = input("Wireless Interface (e.g., wlan0): ").strip()
+        list_interfaces()
+        ifname = input("Network Interface Name (e.g. wlan0, enp0s3): ").strip()
         if not ifname: raise ValueError("Interface name cannot be empty.")
-        
         metric_val = input("Metric (default: 100): ").strip()
         metric = int(metric_val) if metric_val else 100
-        
-        ssid = input("Network SSID: ").strip()
-        if not ssid: raise ValueError("SSID cannot be empty.")
-
-        psk = getpass.getpass("Network Password (8-63 chars): ")
-        if not psk: raise ValueError("Password cannot be empty.")
-
-        temp_profile = {"metric": metric, "ssid": ssid, "psk": psk}
-        
-        valid_profile = validate_interface_profile_data(CONFIG_DIR, ifname, temp_profile)
-        profiles_manager.create_profile(ifname, valid_profile)
+        if is_wireless(ifname):
+            ssid = input("Network SSID: ").strip()
+            if not ssid: raise ValueError("SSID cannot be empty.")
+            psk = getpass.getpass("Network Password (8-63 chars): ")
+            if not psk: raise ValueError("Password cannot be empty.")
+            temp_profile = {"metric": metric, "ssid": ssid, "psk": psk}
+            valid_profile = validate_interface_profile_data(CONFIG_DIR, ifname, temp_profile)
+            profiles_manager.create_profile(ifname, valid_profile)
+        else:
+            temp_profile = {"metric": metric}
+            valid_profile = validate_interface_profile_data(CONFIG_DIR, ifname, temp_profile)
+            profiles_manager.create_profile(ifname, valid_profile)
     elif args.command == 'list-profiles':
         profiles_manager.list_profiles()
     elif args.command == 'remove-profile':
         profiles_manager.remove_profile(args.ifname)
     elif args.command == 'remove-profiles':
         profiles_manager.remove_all_profiles()
+    elif args.command == 'list-interfaces':
+        list_interfaces()
     else:
         parser.print_help()
     
-
 if __name__ == "__main__":
    main()
