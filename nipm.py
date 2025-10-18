@@ -224,7 +224,7 @@ class ProfilesManager:
             profile_to_remove = all_profiles[ifname]
             valid_profile = validate_interface_profile_data(self.config_dir, ifname, profile_to_remove)
             if valid_profile["type"] == "wireless":
-                Path(profile_data['wpa_supplicant_conf_path']).unlink(missing_ok=True)
+                Path(profile_to_remove['wpa_supplicant_conf_path']).unlink(missing_ok=True)
             Path(valid_profile['dhcpcd_conf_path']).unlink(missing_ok=True)
             logging.info(f"Cleaned up config files for '{ifname}'.")
 
@@ -466,6 +466,7 @@ def scan(ifname: str, output_filename: str = None):
         return
 
     try:
+        set_interface_up(ifname)
         result = subprocess.run(
             ["iw", "dev", ifname, "scan"],
             capture_output=True,
