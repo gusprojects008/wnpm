@@ -91,7 +91,7 @@ def get_mac_address(ifname: str) -> str:
         path = Path(f"/sys/class/net/{ifname}/address")
         return path.read_text().strip()
     except Exception:
-        raise ValueError(f"Could not read MAC address for {ifname}")
+        logger.warning(f"Could not read MAC address for {ifname}")
 
 def check_internet_connection(ifname: str) -> bool:
     try:
@@ -113,15 +113,19 @@ def validate_interface_profile_data(CONFIG_DIR, ifname: str, profile_data: Dict[
     logger.info(f"Validating profile for {ifname}...")
 
     if not ifname or not check_interface_exists(ifname):
-        raise ValueError(f"Invalid or non-existent interface: {ifname}")
+        logger.warning(f"Invalid or non-existent interface at startup: {ifname}")
+        hwaddr = None
+    else:
+        hwaddr = get_mac_address(ifname)
 
-    hwaddr = get_mac_address(ifname)
     metric = profile_data.get("metric", 100)
 
     if not isinstance(metric, int) or metric <= 0:
         raise ValueError(f"Invalid metric for {ifname}: {metric}")
 
-    if is_wireless(ifname):
+    is_wifi_config = ("ssid" in profile_data and profile_data["ssid"].strip()) or is_wireless(ifname)
+
+    if is_wifi_config:
         ssid = profile_data.get("ssid", "").strip()
         if not ssid or len(ssid) > 32:
             raise ValueError(f"SSID for {ifname} must be between 1 and 32 characters.")
@@ -174,7 +178,11 @@ def parse_config(CONFIG_DIR, config_file_path: Path) -> List[Tuple[str, Dict[str
              profiles.append((ifname, valid_profile))
          except Exception as error:
              logger.error(f"Unexpected error adding profile of '{ifname}' in profiles list:\n{error}")
-             sys.exit(1)
+             continue
+
+    if not profiles:
+       logger.error("No valid profiles found in configuration.")
+       return []
 
     return profiles
 
@@ -332,36 +340,43 @@ wpa_manager = WPAProcessManager()
 def cleanup_network_processes():
     logger.info("Cleaning up network processes")
     wpa_manager.stop_all()
-    
+
+    subprocess.run(["killall", "wpa_supplicant"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["killall", "dhcpcd"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    """    
     subprocess.run(["pkill", "-9", "wpa_supplicant"], 
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     subprocess.run(["pkill", "-9", "dhcpcd"], 
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """
 
-def _check_wpa_cli_status(ifname: str) -> bool:
+def _check_association(ifname: str) -> bool:
     try:
-        result = subprocess.run(
+        wpa_supplicant_status = subprocess.run(
            ["wpa_cli", "-i", ifname, "status"],
            capture_output=True, text=True, timeout=5
         )
-        return "wpa_state=COMPLETED" in result.stdout
+        carrier_state = Path(f"/sys/class/net/{ifname}/operstate").read_text().strip()
+        return "wpa_state=COMPLETED" in wpa_supplicant_status.stdout and carrier_state == "up"
     except Exception:
         return False
 
 def _start_wpa_supplicant(ifname: str, profile_data: dict) -> bool:
+    timeout = 20
+
     if not wpa_manager.start(ifname, profile_data["wpa_supplicant_conf_path"]):
         return False
     
-    for _ in range(20):
-        if _check_wpa_cli_status(ifname):
+    for _ in range(timeout):
+        if _check_association(ifname):
            logger.info(f"wpa_supplicant connected on {ifname}.")
            return True
         time.sleep(1)
         
     logger.error(f"Timeout waiting for wpa_supplicant connection on {ifname}.")
     wpa_manager.stop(ifname)
-    #cleanup_network_processes()
     return False
 
 def _start_dhcpcd(ifname: str, profile_data: dict) -> bool:
@@ -416,22 +431,12 @@ def start(profiles: List[Tuple[str, Dict[str, Any]]], background: bool, sleep_ti
 
     try:
         while True:
-            """
-            best_candidate_ifname = None
-            for ifname, profile_data in profiles:
-                if not check_interface_exists(ifname):
-                    continue
-
-                if best_candidate_ifname is None:
-                    best_candidate_ifname = ifname
-            """
             best_candidate_ifname = next((ifname for ifname, _ in profiles if check_interface_exists(ifname)), None)
             if best_candidate_ifname != active_ifname:
                 if active_ifname and check_interface_exists(active_ifname):
                     logger.info(f"Switching from '{active_ifname}' to a better interface...")
-                    restart_interface(active_ifname)
+                    set_interface_down(active_ifname)
                     wpa_manager.stop(active_ifname)
-
                 if best_candidate_ifname:
                     logger.info(f"New target interface is '{best_candidate_ifname}'. Attempting to connect.")
                     active_ifname = best_candidate_ifname
@@ -439,7 +444,6 @@ def start(profiles: List[Tuple[str, Dict[str, Any]]], background: bool, sleep_ti
                     connection((active_ifname, current_profile))
                 else:
                     active_ifname = None
-
             elif active_ifname:
                 if not (check_interface_ipv4(active_ifname) or check_internet_connection(active_ifname)):
                     logger.warning(f"Connection on '{active_ifname}' seems down (no IP). Reconnecting...")
